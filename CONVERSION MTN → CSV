@@ -1,0 +1,57 @@
+
+import pyActigraphy as pyA
+import pandas as pd
+import xml.etree.ElementTree as ET
+
+# ÉTAPE 1: LIRE LE FICHIER MTN
+print("EXTRACTION DES DONNÉES MTN")
+
+
+# Chemin du fichier MTN
+chemin_mtn = 'fichier.mtn' 
+
+print(f"\n Lecture: {chemin_mtn}")
+
+# Lire avec pyActigraphy
+raw = pyA.io.read_raw_mtn(chemin_mtn)
+
+print(f" Fichier MTN lu")
+print(f"   Période: {raw.start_time} → {raw.start_time + pd.Timedelta(minutes=len(raw.data))}")
+print(f"   Durée: {len(raw.data)} minutes")
+
+# ÉTAPE 2: EXTRAIRE MOTION ET LIGHT
+
+print("\n" + "="*80)
+print("EXTRACTION MOTION ET LIGHT")
+
+# Créer le DataFrame avec timestamp, motion, et light
+df_minutes = pd.DataFrame({
+    'timestamp': raw.data.index,           # Les timestamps
+    'motion': raw.data.values,             # Les valeurs de mouvement
+    'light': raw.white_light.values        # Les valeurs de lumière
+})
+
+print(f" {len(df_minutes)} minutes extraites")
+
+# Créer colonnes date et heure séparées
+df_minutes['date'] = df_minutes['timestamp'].dt.date
+df_minutes['heure'] = df_minutes['timestamp'].dt.time
+
+# Réorganiser les colonnes
+df_minutes = df_minutes[['date', 'heure', 'timestamp', 'motion', 'light']]
+
+print("\n Aperçu (10 premières lignes):")
+print(df_minutes.head(10))
+
+
+# ÉTAPE 3: SAUVEGARDER EN CSV
+
+print("SAUVEGARDE")
+
+nom_csv = 'donnees_mtn_minutes.csv'
+df_minutes.to_csv(nom_csv, index=False, encoding='utf-8-sig')
+
+print(f" Fichier créé: {nom_csv}")
+print(f"   {len(df_minutes)} lignes × {len(df_minutes.columns)} colonnes")
+
+print("\n Ce fichier sera utilisé pour la fusion avec les données de sommeil")
