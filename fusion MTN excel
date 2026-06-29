@@ -1,0 +1,264 @@
+"""
+Created on Mon Feb 23 13:51:52 2026
+
+@author: bahar
+"""
+
+import re
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import xml.etree.ElementTree as ET
+import pyActigraphy as pyA
+
+
+# =========================
+# CONFIG
+# =========================
+DOSSIER_EXCEL= Path("")   # où sont tes fichiers sommeil_*.xlsx
+DOSSIER_MTN= Path("")    # où sont tes .mtn
+DOSSIER_SORTIE= Path("")
+SKIP_KEYWORD = "nap"   # au cas où, sinon laisse
+
+
+def extraire_patient_id_mtn(mtn_path: Path) -> str:
+    """Extrait le UserID depuis le XML du fichier MTN. Si absent -> INCONNU."""
+    try:
+        tree = ET.parse(str(mtn_path))
+        root = tree.getroot()
+
+        for change in root.findall(".//change"):
+            for prop in change.findall(".//property"):
+                name_elem = prop.find("name")
+                content_elem = prop.find("content")
+
+                if name_elem is not None and name_elem.text and "UserID" in name_elem.text:
+                    if content_elem is not None and content_elem.text:
+                        return content_elem.text.strip()
+    except Exception:
+        pass
+
+    return "INCONNU"
+
+
+def extraire_patient_id_excel(excel_path: Path) -> str:
+    """
+    Extrait patient_id depuis le fichier Excel:
+      - priorité: colonne subject_id (si existe)
+      - sinon: depuis le nom du fichier (pattern type 7348-A-54-036)
+    """
+    try:
+        df = pd.read_excel(excel_path)
+        if "subject_id" in df.columns and len(df) > 0:
+            pid = str(df["subject_id"].iloc[0]).strip()
+            if pid and pid.lower() != "nan":
+                return pid
+    except Exception:
+        pass
+
+    # Fallback: chercher un ID dans le nom du fichier
+    m = re.search(r"([0-9]{4}-[A-Z]-[0-9]{2}-[0-9]{3})", excel_path.name)
+    if m:
+        return m.group(1)
+
+    return "INCONNU"
+
+
+def combiner(date, heure):
+    """Combine une date et une heure pour créer un timestamp complet."""
+    if pd.isna(date) or pd.isna(heure):
+        return pd.NaT
+
+    date = pd.to_datetime(date)
+
+    if isinstance(heure, pd.Timestamp):
+        return heure
+
+    heure_str = str(heure).strip()
+    parts = heure_str.split(':')
+
+    try:
+        h = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 else 0
+    except Exception:
+        return pd.NaT
+
+    return date + pd.Timedelta(hours=h, minutes=m)
+
+
+def check_sommeil(timestamp, periodes):
+    """
+    Retourne:
+      1 = Endormi
+      0 = Éveillé
+
+    Règle:
+      sommeil si ts_coucher < timestamp <= ts_reveil
+    """
+    for _, p in periodes.iterrows():
+        if pd.notna(p["ts_coucher"]) and pd.notna(p["ts_reveil"]):
+            if p["ts_coucher"] < timestamp <= p["ts_reveil"]:
+                return 1
+    return 0
+
+
+def traiter_un_pair(fichier_mtn: Path, fichier_excel: Path, dossier_sortie: Path) -> dict:
+    """
+    Traite 1 fichier MTN + 1 fichier Excel:
+      - lit MTN minute par minute
+      - lit Excel périodes sommeil
+      - calcule sleep (0/1) pour chaque minute
+      - sauvegarde résultat + retourne stats
+    """
+    # Patient ID (on prend celui de l'excel si possible)
+    patient_id = extraire_patient_id_excel(fichier_excel)
+    if patient_id == "INCONNU":
+        patient_id = extraire_patient_id_mtn(fichier_mtn)
+
+    # Lire MTN
+    raw = pyA.io.read_raw_mtn(str(fichier_mtn))
+
+    df_mtn = pd.DataFrame({
+        "patient_id": patient_id,
+        "timestamp": raw.data.index,
+        "motion": raw.data.values,
+        "light": raw.white_light.values
+    })
+
+    # Lire Excel sommeil
+    df_sommeil = pd.read_excel(fichier_excel)
+
+    # Construire timestamps coucher/réveil
+    df_sommeil["ts_coucher"] = df_sommeil.apply(
+        lambda x: combiner(x["Start day"], x["Fell asleep"]),
+        axis=1
+    )
+    df_sommeil["ts_reveil"] = df_sommeil.apply(
+        lambda x: combiner(x["End day"], x["Woke up"]),
+        axis=1
+    )
+
+    # Calcul sleep minute par minute (méthode simple)
+    df_mtn["sleep"] = df_mtn["timestamp"].apply(lambda ts: check_sommeil(ts, df_sommeil))
+
+    # Ordonner les colonnes
+    df_final = df_mtn[["patient_id", "timestamp", "sleep", "motion", "light"]]
+
+    # Sauvegarde
+    dossier_sortie.mkdir(parents=True, exist_ok=True)
+
+    # Nom de sortie (éviter écrasement)
+    base = f"resultat_{patient_id}__{fichier_mtn.stem}__{fichier_excel.stem}"
+    out_xlsx = dossier_sortie / f"{base}.xlsx"
+    out_csv = dossier_sortie / f"{base}.csv"
+
+    df_final.to_excel(out_xlsx, index=False, engine="openpyxl")
+    df_final.to_csv(out_csv, index=False, encoding="utf-8-sig")
+
+    # Stats
+    vc = df_final["sleep"].value_counts().to_dict()
+
+    return {
+        "status": "OK",
+        "patient_id": patient_id,
+        "mtn": str(fichier_mtn),
+        "excel": str(fichier_excel),
+        "minutes": int(len(df_final)),
+        "endormi_minutes": int(vc.get(1, 0)),
+        "eveillé_minutes": int(vc.get(0, 0)),
+        "xlsx_out": str(out_xlsx),
+        "csv_out": str(out_csv),
+    }
+
+
+# BATCH: construire un index et boucler
+
+def indexer_mtn_par_id(dossier_mtn: Path) -> dict:
+    """
+    Index simple: essaie de récupérer l'ID depuis le nom du fichier MTN.
+    Si pas trouvé, on garde dans une liste 'unknown'.
+    """
+    idx = {}
+    unknown = []
+
+    for mtn in sorted(dossier_mtn.rglob("*.mtn")):
+        m = re.search(r"([0-9]{4}-[A-Z]-[0-9]{2}-[0-9]{3})", mtn.name)
+        if m:
+            pid = m.group(1)
+            idx.setdefault(pid, []).append(mtn)
+        else:
+            unknown.append(mtn)
+
+    idx["_unknown"] = unknown
+    return idx
+
+
+def batch_fusion(dossier_excel: Path, dossier_mtn: Path, dossier_sortie: Path) -> pd.DataFrame:
+    """
+    Boucle sur tous les excels sommeil, trouve le MTN correspondant, traite, et génère un rapport.
+    """
+    idx_mtn = indexer_mtn_par_id(dossier_mtn)
+    excels = sorted(dossier_excel.rglob("*.xlsx"))
+
+    results = []
+
+    for excel in excels:
+        # Skip nap
+        if SKIP_KEYWORD and SKIP_KEYWORD.lower() in excel.name.lower():
+            results.append({"status": "SKIPPED_NAP", "excel": str(excel)})
+            continue
+
+        pid = extraire_patient_id_excel(excel)
+        if pid == "INCONNU":
+            results.append({"status": "NO_ID_EXCEL", "excel": str(excel)})
+            continue
+
+        # Match MTN: direct via index
+        candidates = idx_mtn.get(pid, [])
+        mtn_file = candidates[0] if candidates else None
+
+        # Fallback: scanner unknown en lisant XML (plus lent)
+        if mtn_file is None:
+            for cand in idx_mtn["_unknown"]:
+                pid_xml = extraire_patient_id_mtn(cand)
+                if pid_xml == pid:
+                    mtn_file = cand
+                    break
+
+        if mtn_file is None:
+            results.append({"status": "MTN_NOT_FOUND", "patient_id": pid, "excel": str(excel)})
+            print(f"[MTN_NOT_FOUND] {pid} <- {excel.name}")
+            continue
+
+        # Traitement
+        try:
+            res = traiter_un_pair(mtn_file, excel, dossier_sortie)
+            results.append(res)
+            print(f"[OK] {pid} | {mtn_file.name} + {excel.name}")
+        except Exception as e:
+            results.append({
+                "status": "ERROR",
+                "patient_id": pid,
+                "mtn": str(mtn_file),
+                "excel": str(excel),
+                "error": repr(e)
+            })
+            print(f"[ERROR] {pid} -> {e}")
+
+    return pd.DataFrame(results)
+
+# RUN
+
+if __name__ == "__main__":
+    DOSSIER_SORTIE.mkdir(parents=True, exist_ok=True)
+
+    rapport = batch_fusion(DOSSIER_EXCEL, DOSSIER_MTN, DOSSIER_SORTIE)
+
+    # Sauvegarder un rapport global
+    rapport_path = DOSSIER_SORTIE / "rapport_batch_fusion.xlsx"
+    rapport.to_excel(rapport_path, index=False, engine="openpyxl")
+
+    print("\n--- Résumé ---")
+    if "status" in rapport.columns:
+        print(rapport["status"].value_counts(dropna=False))
+    print(f"Rapport sauvegardé: {rapport_path}")
