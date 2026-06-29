@@ -1,0 +1,131 @@
+"""
+Created on Wed Feb 18 10:42:10 2026
+
+@author: bahar
+"""
+import pandas as pd
+import numpy as np
+import os
+import glob
+import matplotlib.pyplot as plt
+
+#CONFIGURATION DES CHEMINS 
+dossier_source = ''
+base_sortie = ''
+
+#Création des sous-dossiers spécifiques
+dossier_csv = os.path.join(base_sortie, 'CSVs')
+dossier_plots = os.path.join(base_sortie, 'Graphics')
+
+os.makedirs(dossier_csv, exist_ok=True)
+os.makedirs(dossier_plots, exist_ok=True)
+
+#FONCTIONS UTILES 
+
+def convertir_date(valeur): #cette fonction normalise les dates, pour eviter toute confusion entre le jour et le mois
+    """Transforme les dates mixtes (FR ou US) en objet Date standard."""
+    if pd.isna(valeur) or str(valeur).strip().lower() in ["", "nan", "none"]:
+        return pd.NaT
+    
+    # Si c'est déjà un format datetime d'Excel
+    if isinstance(valeur, (pd.Timestamp, pd.datetime)):
+        return pd.to_datetime(valeur).normalize()
+    
+    valeur_str = str(valeur).strip()
+    
+    # On teste les deux formats pour éviter les inversions jour/mois
+    for df_option in [True, False]:
+        try:
+            return pd.to_datetime(valeur_str, dayfirst=df_option, errors='raise').normalize() 
+        #le jour en premier, dayfirst=True, si cela échoue ou crée une erreure logique
+        #normalise() pour supprimer les horodatage inutiles (heure/minutes) et ne garde que la date pure 
+        except:
+            continue
+    return pd.NaT
+
+def creer_graphique_disponibilite(df, patient_id, dossier_destination):
+    plt.figure(figsize=(12, 5))
+    plt.fill_between(df['date'], df['analyse_finale'], color="skyblue", alpha=0.4, label="Période active")
+    plt.step(df['date'], df['analyse_finale'], where='mid', color="blue", linewidth=1.5)
+    plt.title(f"Disponibilité des données : Sujet {patient_id}", fontsize=14)
+    plt.xlabel("Dates", fontsize=12)
+    plt.ylabel("État (1=Présent, 0=Absent)", fontsize=12)
+    plt.ylim(-0.1, 1.1)
+    plt.grid(axis='x', linestyle='--', alpha=0.6)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(os.path.join(dossier_destination, f"plot_{patient_id}.png"))
+    plt.close()
+
+# --- TRAITEMENT PRINCIPAL ---
+
+tous_fichiers = glob.glob(os.path.join(dossier_source, "**/*.xlsx"), recursive=True)
+fichiers_excel = [f for f in tous_fichiers if "nap" not in os.path.basename(f).lower()]
+
+for chemin in fichiers_excel:
+    nom_fichier = os.path.basename(chemin)
+    try:
+        patient_id = os.path.splitext(nom_fichier)[0]
+        df_excel = pd.read_excel(chemin, header=None)
+
+        # Localisation Start/End
+        ligne_start_idx = None
+        ligne_end_idx = None
+        for i in range(len(df_excel)):
+            titre = str(df_excel.iloc[i, 0]).lower().strip()
+            if "start day" in titre or "start date" in titre:
+                ligne_start_idx = i
+            elif "end day" in titre or "end date" in titre:
+                ligne_end_idx = i
+        
+        if ligne_start_idx is None: continue
+
+        # Dictionnaires de dates
+        dict_start = {}
+        starts_raw = df_excel.iloc[ligne_start_idx, 1:].tolist()
+        for d in starts_raw:
+            d_clean = convertir_date(d)
+            if pd.notna(d_clean): dict_start[d_clean] = True
+
+        dict_end = {}
+        if ligne_end_idx is not None:
+            for col_idx in range(1, df_excel.shape[1]):
+                d_start = convertir_date(df_excel.iloc[ligne_start_idx, col_idx])
+                val_end = df_excel.iloc[ligne_end_idx, col_idx]
+                if pd.notna(d_start) and pd.notna(val_end) and str(val_end).lower() != "nan":
+                    # Le réveil est le lendemain du coucher
+                    jour_reveil = d_start + pd.Timedelta(days=1)
+                    dict_end[jour_reveil] = True
+
+        # Reconstruction du calendrier
+        toutes_dates = set(list(dict_start.keys()) + list(dict_end.keys()))
+        if not toutes_dates: continue
+        
+        calendrier = pd.date_range(start=min(toutes_dates), end=max(toutes_dates), freq='D').normalize()
+
+        resultats = []
+        for d in calendrier:
+            is_start = 1 if d in dict_start else 0
+            is_end = 1 if d in dict_end else 0
+            valide = 1 if (is_start or is_end) else 0
+            resultats.append({
+                'date': d, 
+                'patient_id': patient_id,
+                'analyse_finale': valide
+            })
+
+        df_final = pd.DataFrame(resultats)
+        
+        # --- CRUCIAL : Sauvegarde avec format de date forcé ---
+        # Ici on force le format YYYY-MM-DD pour que tous les CSV soient identiques
+        df_final.to_csv(
+            os.path.join(dossier_csv, f"cleaned_{patient_id}.csv"), 
+            index=False, 
+            date_format='%Y-%m-%d'
+        )
+        
+        creer_graphique_disponibilite(df_final, patient_id, dossier_plots)
+        print(f" {patient_id} : CSV standardisé et Plot générés")
+
+    except Exception as e:
+        print(f" Erreur sur {nom_fichier} : {e}")
