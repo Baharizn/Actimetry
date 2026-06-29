@@ -1,0 +1,172 @@
+"""
+Created on Thu Feb 19 15:56:10 2026
+fusion mtn et excel
+@author: bahar
+"""
+
+# FUSION: MTN (MINUTE PAR MINUTE) + EXCEL (PÉRIODES DE SOMMEIL)
+
+import pandas as pd
+import numpy as np
+import pyActigraphy as pyA
+
+# CONFIGURATION
+# Fichiers d'entrée
+FICHIER_MTN = '.mtn'
+FICHIER_EXCEL = '.xlsx'
+
+# Étape 1: Extraire l'ID du patient depuis le fichier MTN
+print("1. Extraction de l'ID patient...", end=" ")
+
+# Parser le fichier MTN (qui est en XML)
+tree = ET.parse(FICHIER_MTN)
+root = tree.getroot()
+
+# Chercher le UserID dans le XML
+patient_id = None
+for change in root.findall('.//change'):
+    for prop in change.findall('.//property'):
+        name_elem = prop.find('name')
+        content_elem = prop.find('content')
+        
+        if name_elem is not None and 'UserID' in name_elem.text:
+            if content_elem is not None:
+                patient_id = content_elem.text
+                break
+    if patient_id:
+        break
+
+# Si pas trouvé, utiliser "INCONNU"
+if not patient_id:
+    patient_id = "INCONNU"
+
+print(f"OK (ID: {patient_id})")
+
+# Étape 2: Lire le fichier MTN
+
+print("2. Lecture du fichier MTN...", end=" ")
+
+raw = pyA.io.read_raw_mtn(FICHIER_MTN)
+
+# Créer un tableau avec les données minute par minute
+df_mtn = pd.DataFrame({
+    'patient_id': patient_id,         # ← NOUVEAU: Ajouter l'ID patient
+    'timestamp': raw.data.index,
+    'motion': raw.data.values,
+    'light': raw.white_light.values
+})
+
+print(f"OK ({len(df_mtn)} minutes)")
+
+# Étape 3: Lire le fichier Excel
+
+print("3. Lecture du fichier Excel...", end=" ")
+
+df_sommeil = pd.read_excel(FICHIER_EXCEL)
+
+print(f"OK ({len(df_sommeil)} nuits)")
+
+
+# Étape 4: Créer des timestamps complets pour le sommeil
+
+print("4. Création des timestamps...", end=" ")
+
+def combiner(date, heure):
+    """Combine une date et une heure pour créer un timestamp complet"""
+    
+    if pd.isna(date) or pd.isna(heure):
+        return pd.NaT
+    
+    date = pd.to_datetime(date)
+    
+    if isinstance(heure, pd.Timestamp):
+        return heure
+    
+    heure_str = str(heure) #convertir en chaîne de caractères
+    parts = heure_str.split(':')  #découper la chaîne par le caractère :
+    
+    h = int(parts[0]) #premier élément de la liste (les heures)
+    m = int(parts[1]) if len(parts) > 1 else 0
+    
+    return date + pd.Timedelta(hours=h, minutes=m)
+
+# Appliquer sur chaque ligne
+df_sommeil['ts_coucher'] = df_sommeil.apply(
+    lambda x: combiner(x['Start day'], x['Fell asleep']),
+    axis=1
+)
+
+df_sommeil['ts_reveil'] = df_sommeil.apply(
+    lambda x: combiner(x['End day'], x['Woke up']),
+    axis=1
+)
+
+print("OK")
+
+# Étape 5: Déterminer le statut de sommeil pour chaque minute
+
+print("5. Attribution du statut de sommeil...", end=" ")
+def check_sommeil(timestamp, periodes):
+    """
+    Vérifie si à ce timestamp, la personne dormait
+    
+    IMPORTANT: 
+    - ts_coucher = moment où la personne se couche (pas encore endormie)
+    - Le sommeil commence APRÈS ts_coucher
+    - ts_reveil = moment du réveil (encore endormie à cet instant)
+    """
+    
+    for _, p in periodes.iterrows():
+        if pd.notna(p['ts_coucher']) and pd.notna(p['ts_reveil']):
+            
+            # Sommeil = APRÈS coucher et JUSQU'AU réveil inclus
+            if p['ts_coucher'] < timestamp <= p['ts_reveil']:
+                return 'Endormi'
+    
+    return 'Éveillé'
+
+# Appliquer à chaque minute
+df_mtn['statut'] = df_mtn['timestamp'].apply(
+    lambda ts: check_sommeil(ts, df_sommeil)
+)
+
+print("OK")
+
+
+# Étape 6: Réorganiser les colonnes
+
+# Mettre patient_id en premier, puis le reste
+colonnes_ordre = ['patient_id', 'timestamp', 'statut', 'motion', 'light']
+df_final = df_mtn[colonnes_ordre]
+
+# Étape 7: Afficher statistiques
+
+
+print(f"\nPatient ID: {patient_id}")
+print(f"Période: {df_final['timestamp'].min()} → {df_final['timestamp'].max()}")
+print(f"Total minutes: {len(df_final)}")
+
+print("\nRépartition:")
+print(df_final['statut'].value_counts())
+
+print("\nStatistiques par statut:")
+for statut in ['Endormi', 'Éveillé']:
+    data = df_final[df_final['statut'] == statut]
+    if len(data) > 0:
+        print(f"\n{statut}:")
+        print(f"  Minutes: {len(data)}")
+        print(f"  Motion moyen: {data['motion'].mean():.2f}")
+        print(f"  Light moyen: {data['light'].mean():.2f} lux")
+
+
+print(df_final.head(10).to_string())
+
+# Créer nom de fichier avec l'ID patient
+nom_excel = f'resultat_{patient_id}.xlsx'
+nom_csv = f'resultat_{patient_id}.csv'
+
+df_final.to_excel(nom_excel, index=False)
+df_final.to_csv(nom_csv, index=False, encoding='utf-8-sig')
+
+print(f"✅ Excel: {nom_excel}")
+print(f"✅ CSV: {nom_csv}")
